@@ -10,10 +10,11 @@
  *   5. Conv2d forward: batch=8, 3x32x32 -> 16x30x30
  *
  * Set CML_BACKEND=opencl to benchmark OpenCL GPU path.
- * Set CML_BACKEND=metal to benchmark Metal GPU path (macOS).
+ * Set CML_BACKEND=metal to benchmark Metal GPU path with MPS (macOS).
  */
 #define _POSIX_C_SOURCE 199309L
 #include "cml.h"
+#include "ops/ir/gpu/metal_backend.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,7 @@
 #include <math.h>
 
 static DeviceType g_device = DEVICE_CPU;
+static int g_use_mps = 0;
 
 static void cooldown_ms(int ms) {
     struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
@@ -263,7 +265,12 @@ int main(void) {
     const char* backend = getenv("CML_BACKEND");
     if (backend && strcmp(backend, "metal") == 0) {
         g_device = DEVICE_METAL;
-        fprintf(stderr, "bench: using Metal GPU backend\n");
+        g_use_mps = cml_mps_available();
+        if (g_use_mps) {
+            fprintf(stderr, "bench: using Metal MPS backend\n");
+        } else {
+            fprintf(stderr, "bench: using Metal GPU backend (custom MSL)\n");
+        }
     } else if (backend && strcmp(backend, "opencl") == 0) {
         g_device = DEVICE_OPENCL;
         fprintf(stderr, "bench: using OpenCL GPU backend\n");
@@ -272,14 +279,114 @@ int main(void) {
     cml_init();
     srand(42);
 
-    double gemm_512  = bench_gemm(512);
-    double fused_512  = bench_fused(512);
-    double gemm_1024 = bench_gemm(1024);
-    double fused_1024 = bench_fused(1024);
-    cooldown_ms(200);
-    double gemm_2048 = bench_gemm(2048);
-    cooldown_ms(200);
-    double fused_2048 = bench_fused(2048);
+    double gemm_512, gemm_1024, gemm_2048;
+    double fused_512, fused_1024, fused_2048;
+
+    if (g_use_mps) {
+        float* a512 = malloc(512*512*sizeof(float));
+        float* b512 = malloc(512*512*sizeof(float));
+        float* c512 = malloc(512*512*sizeof(float));
+        fill_random(a512, 512*512);
+        fill_random(b512, 512*512);
+        
+        for (int i = 0; i < 3; i++) cml_mps_matmul(a512, b512, c512, 512, 512, 512);
+        
+        double times[5];
+        for (int r = 0; r < 5; r++) {
+            double t0 = now();
+            for (int i = 0; i < 5; i++) cml_mps_matmul(a512, b512, c512, 512, 512, 512);
+            times[r] = (now() - t0) / 5 * 1e3;
+        }
+        gemm_512 = median(times, 5);
+        
+        float* a1024 = malloc(1024*1024*sizeof(float));
+        float* b1024 = malloc(1024*1024*sizeof(float));
+        float* c1024 = malloc(1024*1024*sizeof(float));
+        fill_random(a1024, 1024*1024);
+        fill_random(b1024, 1024*1024);
+        for (int i = 0; i < 3; i++) cml_mps_matmul(a1024, b1024, c1024, 1024, 1024, 1024);
+        
+        for (int r = 0; r < 5; r++) {
+            double t0 = now();
+            for (int i = 0; i < 5; i++) cml_mps_matmul(a1024, b1024, c1024, 1024, 1024, 1024);
+            times[r] = (now() - t0) / 5 * 1e3;
+        }
+        gemm_1024 = median(times, 5);
+        
+        cooldown_ms(200);
+        
+        float* a2048 = malloc(2048*2048*sizeof(float));
+        float* b2048 = malloc(2048*2048*sizeof(float));
+        float* c2048 = malloc(2048*2048*sizeof(float));
+        fill_random(a2048, 2048*2048);
+        fill_random(b2048, 2048*2048);
+        for (int i = 0; i < 3; i++) cml_mps_matmul(a2048, b2048, c2048, 2048, 2048, 2048);
+        
+        for (int r = 0; r < 5; r++) {
+            double t0 = now();
+            for (int i = 0; i < 3; i++) cml_mps_matmul(a2048, b2048, c2048, 2048, 2048, 2048);
+            times[r] = (now() - t0) / 3 * 1e3;
+        }
+        gemm_2048 = median(times, 5);
+        
+        cooldown_ms(200);
+        
+        float* bias512 = malloc(512*sizeof(float));
+        fill_random(bias512, 512);
+        for (int i = 0; i < 3; i++) cml_mps_matmul_fused_bias_relu(a512, b512, bias512, c512, 512, 512, 512);
+        
+        for (int r = 0; r < 5; r++) {
+            double t0 = now();
+            for (int i = 0; i < 5; i++) cml_mps_matmul_fused_bias_relu(a512, b512, bias512, c512, 512, 512, 512);
+            times[r] = (now() - t0) / 5 * 1e3;
+        }
+        fused_512 = median(times, 5);
+        
+        float* bias1024 = malloc(1024*sizeof(float));
+        fill_random(bias1024, 1024);
+        for (int i = 0; i < 3; i++) cml_mps_matmul_fused_bias_relu(a1024, b1024, bias1024, c1024, 1024, 1024, 1024);
+        
+        for (int r = 0; r < 5; r++) {
+            double t0 = now();
+            for (int i = 0; i < 5; i++) cml_mps_matmul_fused_bias_relu(a1024, b1024, bias1024, c1024, 1024, 1024, 1024);
+            times[r] = (now() - t0) / 5 * 1e3;
+        }
+        fused_1024 = median(times, 5);
+        
+        cooldown_ms(200);
+        
+        float* bias2048 = malloc(2048*sizeof(float));
+        fill_random(bias2048, 2048);
+        for (int i = 0; i < 3; i++) cml_mps_matmul_fused_bias_relu(a2048, b2048, bias2048, c2048, 2048, 2048, 2048);
+        
+        for (int r = 0; r < 5; r++) {
+            double t0 = now();
+            for (int i = 0; i < 3; i++) cml_mps_matmul_fused_bias_relu(a2048, b2048, bias2048, c2048, 2048, 2048, 2048);
+            times[r] = (now() - t0) / 3 * 1e3;
+        }
+        fused_2048 = median(times, 5);
+        
+        free(a512); free(b512); free(c512); free(bias512);
+        free(a1024); free(b1024); free(c1024); free(bias1024);
+        free(a2048); free(b2048); free(c2048); free(bias2048);
+        
+        gemm_512 = gemm_512;
+        gemm_1024 = gemm_1024;
+        gemm_2048 = gemm_2048;
+        fused_512 = fused_512;
+        fused_1024 = fused_1024;
+        fused_2048 = fused_2048;
+    } else {
+        gemm_512  = bench_gemm(512);
+        fused_512  = bench_fused(512);
+        gemm_1024 = bench_gemm(1024);
+        fused_1024 = bench_fused(1024);
+        cooldown_ms(200);
+        gemm_2048 = bench_gemm(2048);
+        cooldown_ms(200);
+        fused_2048 = bench_fused(2048);
+    }
+    
     cooldown_ms(100);
     double mlp_fwd   = bench_mlp_forward();
     double mlp_train  = bench_mlp_train();
