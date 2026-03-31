@@ -3476,12 +3476,14 @@ int cml_ir_execute_up_to(CMLGraph_t ir, struct IRNode* target_node) {
     static int s_use_backend = 0;
     static CMLBackendType s_backend_type = CML_BACKEND_CPU_FALLBACK;
     static CMLDispatchContext* s_dispatch_ctx = NULL;
+    static int s_metal_skip_small = 0;
     if (!s_backend_checked) {
         const char* backend_env = getenv("CML_BACKEND");
         if (backend_env) {
             if (strcasecmp(backend_env, "metal") == 0 || strcasecmp(backend_env, "mtl") == 0) {
                 s_backend_type = CML_BACKEND_METAL;
                 s_use_backend = 1;
+                s_metal_skip_small = 1;
             } else if (strcasecmp(backend_env, "opencl") == 0 || strcasecmp(backend_env, "cl") == 0) {
                 s_backend_type = CML_BACKEND_OPENCL;
                 s_use_backend = 1;
@@ -3491,7 +3493,20 @@ int cml_ir_execute_up_to(CMLGraph_t ir, struct IRNode* target_node) {
             s_dispatch_ctx = cml_dispatch_get_global();
         s_backend_checked = 1;
     }
-    if (s_use_backend && s_dispatch_ctx) {
+    
+    if (s_use_backend && s_dispatch_ctx && target_node) {
+        if (s_metal_skip_small && s_backend_type == CML_BACKEND_METAL) {
+            size_t total_elements = 0;
+            struct IRNode* n = ir->head;
+            while (n) {
+                if (n->output && n->output->numel > 0)
+                    total_elements += n->output->numel;
+                n = n->next;
+            }
+            if (total_elements < 2048 * 2048) {
+                return cpu_execute_ir(ir);
+            }
+        }
         int r = cml_dispatch_execute_on(s_dispatch_ctx, s_backend_type, ir, NULL, 0, NULL, 0);
         if (r == 0) return 0;
     }
